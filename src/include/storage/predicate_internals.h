@@ -38,6 +38,12 @@ typedef uint64 SerCommitSeqNo;
 #define FirstNormalSerCommitSeqNo	((SerCommitSeqNo) 2)
 
 /*
+ * Hash table size in SERIALIZABLEXACT 
+ */
+#define SERIALIZABLEXACT_CONFLICT_HASHTAB_SIZE 200
+
+
+/*
  * The SERIALIZABLEXACT struct contains information needed for each
  * serializable database transaction to support SSI techniques.
  *
@@ -83,10 +89,14 @@ typedef struct SERIALIZABLEXACT
 		SerCommitSeqNo lastCommitBeforeSnapshot;		/* when not committed or
 														 * no conflict out */
 	}			SeqNo;
-	SHM_QUEUE	outConflicts;	/* list of write transactions whose data we
+/*	SHM_QUEUE	outConflicts;	/* list of write transactions whose data we
 								 * couldn't read. */
-	SHM_QUEUE	inConflicts;	/* list of read transactions which couldn't
+/*	SHM_QUEUE	inConflicts;	/* list of read transactions which couldn't
 								 * see our write. */
+
+	HTAB*		outConflictsTab;	/* Table of write transactions whose data we couldn't read  */
+	HTAB*		inConflictsTab;		/* Table of read transactions which couldn't see our write. */
+
 	SHM_QUEUE	predicateLocks; /* list of associated PREDICATELOCK objects */
 	SHM_QUEUE	finishedLink;	/* list link in
 								 * FinishedSerializableTransactions */

@@ -471,6 +471,20 @@ static void OnConflict_CheckForSerializationFailure(const SERIALIZABLEXACT *read
 /*------------------------------------------------------------------------*/
 
 /*
+ * Test whether a hash table is empty.
+ * I didn't find any function in dynamic hash supports the requirement.
+ */
+static inline bool hash_table_empty(HTAB* hashp)
+{
+	HASH_SEQ_STATUS seqstat;
+	hash_seq_init(&seqstat, hashp);
+	return hash_seq_search(&seqstat) == NULL;
+}
+
+
+/*------------------------------------------------------------------------*/
+
+/*
  * Does this relation participate in predicate locking? Temporary and system
  * relations are exempt, as are materialized views.
  */
@@ -573,6 +587,14 @@ CreatePredXact(void)
 
 	SHMQueueDelete(&ptle->link);
 	SHMQueueInsertBefore(&PredXact->activeList, &ptle->link);
+
+	/*
+	 * NOTE: We don't need to clean the HTAB, because all of its elements
+	 *		 has been released before.
+	 */
+	Assert(hash_table_empty(ptle->inConflictsTab));
+	Assert(hash_table_empty(ptle->outConflictsTab));
+
 	return &ptle->sxact;
 }
 
@@ -635,62 +657,61 @@ NextPredXact(SERIALIZABLEXACT *sxact)
 static bool
 RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 {
-	RWConflict	conflict;
+	bool found;
 
 	Assert(reader != writer);
 
-	/* Check the ends of the purported conflict first. */
+	/* Check the ends of the purported conflict first*/
 	if (SxactIsDoomed(reader)
-		|| SxactIsDoomed(writer)
-		|| SHMQueueEmpty(&reader->outConflicts)
-		|| SHMQueueEmpty(&writer->inConflicts))
+		|| SxactIsDoomed(writer))
 		return false;
 
-	/* A conflict is possible; walk the list to find out. */
-	conflict = (RWConflict)
-		SHMQueueNext(&reader->outConflicts,
-					 &reader->outConflicts,
-					 offsetof(RWConflictData, outLink));
-	while (conflict)
-	{
-		if (conflict->sxactIn == writer)
-			return true;
-		conflict = (RWConflict)
-			SHMQueueNext(&reader->outConflicts,
-						 &conflict->outLink,
-						 offsetof(RWConflictData, outLink));
-	}
+	hash_search(reader->outConflictsTab,
+				&writer,
+				HASH_FIND,
+				&found);
 
-	/* No conflict found. */
-	return false;
+	return found;
 }
 
 static void
 SetRWConflict(SERIALIZABLEXACT *reader, SERIALIZABLEXACT *writer)
 {
-	RWConflict	conflict;
+	RWConflict conflict;
+	bool found;
 
 	Assert(reader != writer);
 	Assert(!RWConflictExists(reader, writer));
 
-	conflict = (RWConflict)
-		SHMQueueNext(&RWConflictPool->availableList,
-					 &RWConflictPool->availableList,
-					 offsetof(RWConflictData, outLink));
-	if (!conflict)
-		ereport(ERROR,
+	conflict = (RWConflict)hash_search(reader->outConflictsTab,
+										&writer,
+										HASH_ENTER_NULL,
+										&found);
+	if (!conflict){
+		ereport(ERROR, 
 				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("not enough elements in RWConflictPool to record a read/write conflict"),
-				 errhint("You might need to run fewer transactions at a time or increase max_connections.")));
-
-	SHMQueueDelete(&conflict->outLink);
-
+				 errmsg("insert to outRWconflicts hash table failed")));
+	}  
 	conflict->sxactOut = reader;
 	conflict->sxactIn = writer;
-	SHMQueueInsertBefore(&reader->outConflicts, &conflict->outLink);
-	SHMQueueInsertBefore(&writer->inConflicts, &conflict->inLink);
+
+	conflict = (RWConflict)hash_search(writer->inConflictsTab,
+										&reader,
+										HASH_ENTER_NULL,
+										&found);
+	if (!conflict){
+		ereport(ERROR, 
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("insert to inRWconflicts hash table failed")));
+	}
+	conflict->sxactOut = reader;
+	conflict->sxactIn = writer;
 }
 
+/*
+ *	NOTE: possibleUnsafeConflict is still stored in a list; 
+ *		  we will replace it later;
+ */
 static void
 SetPossibleUnsafeConflict(SERIALIZABLEXACT *roXact,
 						  SERIALIZABLEXACT *activeXact)
@@ -723,6 +744,24 @@ SetPossibleUnsafeConflict(SERIALIZABLEXACT *roXact,
 
 static void
 ReleaseRWConflict(RWConflict conflict)
+{
+	bool found;
+
+	(RWConflict*)hash_search(conflict->sxactOut->outConflictsTab,
+										&conflict->sxactIn,
+										HASH_REMOVE,
+										&found);
+	Assert(found);
+
+	(RWConflict*)hash_search(conflict->sxactOut->outConflictsTab,
+										&conflict->sxactIn,
+										HASH_REMOVE,
+										&found);
+	Assert(found);
+}
+
+static void
+ReleaseUnsafeRWConflict(RWConflict conflict)
 {
 	SHMQueueDelete(&conflict->inLink);
 	SHMQueueDelete(&conflict->outLink);
@@ -758,7 +797,7 @@ FlagSxactUnsafe(SERIALIZABLEXACT *sxact)
 		Assert(!SxactIsReadOnly(conflict->sxactOut));
 		Assert(sxact == conflict->sxactIn);
 
-		ReleaseRWConflict(conflict);
+		ReleaseUnsafeRWConflict(conflict);
 
 		conflict = nextConflict;
 	}
@@ -1180,6 +1219,7 @@ InitPredicateLocks(void)
 	if (!found)
 	{
 		int			i;
+		const char	name[80];
 
 		SHMQueueInit(&PredXact->availableList);
 		SHMQueueInit(&PredXact->activeList);
@@ -1194,18 +1234,41 @@ InitPredicateLocks(void)
 		PredXact->element = ShmemAlloc(requestSize);
 		/* Add all elements to available list, clean. */
 		memset(PredXact->element, 0, requestSize);
+
+		MemSet(&info, 0, sizeof(info));
+		info.keysize = sizeof(SERIALIZABLEXACT*);
+		info.entrysize = sizeof(RWConflictData);
+		info.num_partitions = NUM_PREDICATELOCK_PARTITIONS;
+
 		for (i = 0; i < max_table_size; i++)
 		{
 			SHMQueueInsertBefore(&(PredXact->availableList),
 								 &(PredXact->element[i].link));
+
+			sprintf(name, "PredXact inConflictsTab %d", i);
+			PredXact->element[i].sxact.inConflictsTab = ShmemInitHash(name, 
+																  SERIALIZABLEXACT_CONFLICT_HASHTAB_SIZE, 
+																  SERIALIZABLEXACT_CONFLICT_HASHTAB_SIZE, 
+																  &info, 
+																  HASH_ELEM | HASH_BLOBS | 
+																  HASH_PARTITION | HASH_FIXED_SIZE);
+
+			sprintf(name, "PredXact outConflictsTab %d", i);
+			PredXact->element[i].sxact.outConflictsTab = ShmemInitHash(name,
+																  SERIALIZABLEXACT_CONFLICT_HASHTAB_SIZE, 
+																  SERIALIZABLEXACT_CONFLICT_HASHTAB_SIZE, 
+																  &info, 
+																  HASH_ELEM | HASH_BLOBS |
+																  HASH_PARTITION | HASH_FIXED_SIZE); 
 		}
+		printf("max_table_size: %d\n", max_table_size);
 		PredXact->OldCommittedSxact = CreatePredXact();
 		SetInvalidVirtualTransactionId(PredXact->OldCommittedSxact->vxid);
 		PredXact->OldCommittedSxact->prepareSeqNo = 0;
 		PredXact->OldCommittedSxact->commitSeqNo = 0;
 		PredXact->OldCommittedSxact->SeqNo.lastCommitBeforeSnapshot = 0;
-		SHMQueueInit(&PredXact->OldCommittedSxact->outConflicts);
-		SHMQueueInit(&PredXact->OldCommittedSxact->inConflicts);
+		//SHMQueueInit(&PredXact->OldCommittedSxact->outConflicts);
+		//SHMQueueInit(&PredXact->OldCommittedSxact->inConflicts);
 		SHMQueueInit(&PredXact->OldCommittedSxact->predicateLocks);
 		SHMQueueInit(&PredXact->OldCommittedSxact->finishedLink);
 		SHMQueueInit(&PredXact->OldCommittedSxact->possibleUnsafeConflicts);
@@ -1319,6 +1382,15 @@ PredicateLockShmemSize(void)
 	size = add_size(size, PredXactListDataSize);
 	size = add_size(size, mul_size((Size) max_table_size,
 								   PredXactListElementDataSize));
+
+	/* Hash table in Sxact 
+	 *
+	 * NOTE: It should be 2*max_table_size*hash_table_size. because for each Sxact, there are two HTAB: inConflictsTab and outConflictsTab.
+	 *		 But I don't know why this setting will cause "out of memory". So I set it as 4.
+	 */
+	size = add_size(size, mul_size((Size) 4*max_table_size, 
+								   hash_estimate_size(SERIALIZABLEXACT_CONFLICT_HASHTAB_SIZE, 
+								   sizeof(RWConflict))));
 
 	/* transaction xid table */
 	size = add_size(size, hash_estimate_size(max_table_size,
@@ -1796,8 +1868,8 @@ GetSerializableTransactionSnapshotInt(Snapshot snapshot,
 	sxact->SeqNo.lastCommitBeforeSnapshot = PredXact->LastSxactCommitSeqNo;
 	sxact->prepareSeqNo = InvalidSerCommitSeqNo;
 	sxact->commitSeqNo = InvalidSerCommitSeqNo;
-	SHMQueueInit(&(sxact->outConflicts));
-	SHMQueueInit(&(sxact->inConflicts));
+	//SHMQueueInit(&(sxact->outConflicts));
+	//SHMQueueInit(&(sxact->inConflicts));
 	SHMQueueInit(&(sxact->possibleUnsafeConflicts));
 	sxact->topXid = GetTopTransactionIdIfAny();
 	sxact->finishedBefore = InvalidTransactionId;
@@ -3253,6 +3325,7 @@ ReleasePredicateLocks(bool isCommit)
 				nextConflict,
 				possibleUnsafeConflict;
 	SERIALIZABLEXACT *roXact;
+	HASH_SEQ_STATUS seqstat;
 
 	/*
 	 * We can't trust XactReadOnly here, because a transaction which started
@@ -3375,7 +3448,7 @@ ReleasePredicateLocks(bool isCommit)
 			Assert(!SxactIsReadOnly(possibleUnsafeConflict->sxactOut));
 			Assert(MySerializableXact == possibleUnsafeConflict->sxactIn);
 
-			ReleaseRWConflict(possibleUnsafeConflict);
+			ReleaseUnsafeRWConflict(possibleUnsafeConflict);
 
 			possibleUnsafeConflict = nextConflict;
 		}
@@ -3400,17 +3473,9 @@ ReleasePredicateLocks(bool isCommit)
 	 * back clear them all.  Set SXACT_FLAG_CONFLICT_OUT if any point to
 	 * previously committed transactions.
 	 */
-	conflict = (RWConflict)
-		SHMQueueNext(&MySerializableXact->outConflicts,
-					 &MySerializableXact->outConflicts,
-					 offsetof(RWConflictData, outLink));
-	while (conflict)
+	hash_seq_init(&seqstat, MySerializableXact->outConflictsTab);
+	while(conflict = (RWConflict)hash_seq_search(&seqstat))
 	{
-		nextConflict = (RWConflict)
-			SHMQueueNext(&MySerializableXact->outConflicts,
-						 &conflict->outLink,
-						 offsetof(RWConflictData, outLink));
-
 		if (isCommit
 			&& !SxactIsReadOnly(MySerializableXact)
 			&& SxactIsCommitted(conflict->sxactIn))
@@ -3425,32 +3490,21 @@ ReleasePredicateLocks(bool isCommit)
 			|| SxactIsCommitted(conflict->sxactIn)
 			|| (conflict->sxactIn->SeqNo.lastCommitBeforeSnapshot >= PredXact->LastSxactCommitSeqNo))
 			ReleaseRWConflict(conflict);
-
-		conflict = nextConflict;
 	}
 
 	/*
 	 * Release all inConflicts from committed and read-only transactions. If
 	 * we're rolling back, clear them all.
 	 */
-	conflict = (RWConflict)
-		SHMQueueNext(&MySerializableXact->inConflicts,
-					 &MySerializableXact->inConflicts,
-					 offsetof(RWConflictData, inLink));
-	while (conflict)
+	hash_seq_init(&seqstat, MySerializableXact->inConflictsTab);
+	while(conflict = (RWConflict)hash_seq_search(&seqstat))
 	{
-		nextConflict = (RWConflict)
-			SHMQueueNext(&MySerializableXact->inConflicts,
-						 &conflict->inLink,
-						 offsetof(RWConflictData, inLink));
-
 		if (!isCommit
 			|| SxactIsCommitted(conflict->sxactOut)
 			|| SxactIsReadOnly(conflict->sxactOut))
 			ReleaseRWConflict(conflict);
-
-		conflict = nextConflict;
 	}
+
 
 	if (!topLevelIsDeclaredReadOnly)
 	{
@@ -3728,6 +3782,7 @@ ReleaseOneSerializableXact(SERIALIZABLEXACT *sxact, bool partial,
 	SERIALIZABLEXIDTAG sxidtag;
 	RWConflict	conflict,
 				nextConflict;
+	HASH_SEQ_STATUS seqstat;
 
 	Assert(sxact != NULL);
 	Assert(SxactIsRolledBack(sxact) || SxactIsCommitted(sxact));
@@ -3823,41 +3878,25 @@ ReleaseOneSerializableXact(SERIALIZABLEXACT *sxact, bool partial,
 	sxidtag.xid = sxact->topXid;
 	LWLockAcquire(SerializableXactHashLock, LW_EXCLUSIVE);
 
-	/* Release all outConflicts (unless 'partial' is true) */
+	/* Release all outConflictsTab (unless 'partial' is true) */
 	if (!partial)
 	{
-		conflict = (RWConflict)
-			SHMQueueNext(&sxact->outConflicts,
-						 &sxact->outConflicts,
-						 offsetof(RWConflictData, outLink));
-		while (conflict)
+		hash_seq_init(&seqstat, sxact->outConflictsTab);
+		while(conflict = (RWConflict)hash_seq_search(&seqstat))
 		{
-			nextConflict = (RWConflict)
-				SHMQueueNext(&sxact->outConflicts,
-							 &conflict->outLink,
-							 offsetof(RWConflictData, outLink));
 			if (summarize)
 				conflict->sxactIn->flags |= SXACT_FLAG_SUMMARY_CONFLICT_IN;
 			ReleaseRWConflict(conflict);
-			conflict = nextConflict;
 		}
 	}
 
-	/* Release all inConflicts. */
-	conflict = (RWConflict)
-		SHMQueueNext(&sxact->inConflicts,
-					 &sxact->inConflicts,
-					 offsetof(RWConflictData, inLink));
-	while (conflict)
+	/* Release all inConflictsTab. */
+	hash_seq_init(&seqstat, sxact->inConflictsTab);
+	while(conflict = (RWConflict)hash_seq_search(&seqstat))
 	{
-		nextConflict = (RWConflict)
-			SHMQueueNext(&sxact->inConflicts,
-						 &conflict->inLink,
-						 offsetof(RWConflictData, inLink));
 		if (summarize)
 			conflict->sxactOut->flags |= SXACT_FLAG_SUMMARY_CONFLICT_OUT;
 		ReleaseRWConflict(conflict);
-		conflict = nextConflict;
 	}
 
 	/* Finally, get rid of the xid and the record of the transaction itself. */
@@ -4035,7 +4074,8 @@ CheckForSerializableConflictOut(bool visible, Relation relation,
 					  errhint("The transaction might succeed if retried.")));
 
 			if (SxactHasSummaryConflictIn(MySerializableXact)
-				|| !SHMQueueEmpty(&MySerializableXact->inConflicts))
+			//	|| !SHMQueueEmpty(&MySerializableXact->inConflicts))
+				|| !hash_table_empty(MySerializableXact->inConflictsTab))
 				ereport(ERROR,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 						 errmsg("could not serialize access due to read/write dependencies among transactions"),
@@ -4520,6 +4560,7 @@ OnConflict_CheckForSerializationFailure(const SERIALIZABLEXACT *reader,
 {
 	bool		failure;
 	RWConflict	conflict;
+	HASH_SEQ_STATUS seqstat;
 
 	Assert(LWLockHeldByMe(SerializableXactHashLock));
 
@@ -4567,29 +4608,24 @@ OnConflict_CheckForSerializationFailure(const SERIALIZABLEXACT *reader,
 			conflict = NULL;
 		}
 		else
-			conflict = (RWConflict)
-				SHMQueueNext(&writer->outConflicts,
-							 &writer->outConflicts,
-							 offsetof(RWConflictData, outLink));
-		while (conflict)
 		{
-			SERIALIZABLEXACT *t2 = conflict->sxactIn;
-
-			if (SxactIsPrepared(t2)
-				&& (!SxactIsCommitted(reader)
-					|| t2->prepareSeqNo <= reader->commitSeqNo)
-				&& (!SxactIsCommitted(writer)
-					|| t2->prepareSeqNo <= writer->commitSeqNo)
-				&& (!SxactIsReadOnly(reader)
-			  || t2->prepareSeqNo <= reader->SeqNo.lastCommitBeforeSnapshot))
+			hash_seq_init(&seqstat, writer->outConflictsTab);
+			while (conflict = hash_seq_search(&seqstat))
 			{
-				failure = true;
-				break;
+				SERIALIZABLEXACT *t2 = conflict->sxactIn;
+
+				if (SxactIsPrepared(t2)
+					&& (!SxactIsCommitted(reader)
+						|| t2->prepareSeqNo <= reader->commitSeqNo)
+					&& (!SxactIsCommitted(writer)
+						|| t2->prepareSeqNo <= writer->commitSeqNo)
+					&& (!SxactIsReadOnly(reader)
+				  || t2->prepareSeqNo <= reader->SeqNo.lastCommitBeforeSnapshot))
+				{
+					failure = true;
+					break;
+				}
 			}
-			conflict = (RWConflict)
-				SHMQueueNext(&writer->outConflicts,
-							 &conflict->outLink,
-							 offsetof(RWConflictData, outLink));
 		}
 	}
 
@@ -4614,27 +4650,22 @@ OnConflict_CheckForSerializationFailure(const SERIALIZABLEXACT *reader,
 			conflict = NULL;
 		}
 		else
-			conflict = (RWConflict)
-				SHMQueueNext(&reader->inConflicts,
-							 &reader->inConflicts,
-							 offsetof(RWConflictData, inLink));
-		while (conflict)
 		{
-			SERIALIZABLEXACT *t0 = conflict->sxactOut;
-
-			if (!SxactIsDoomed(t0)
-				&& (!SxactIsCommitted(t0)
-					|| t0->commitSeqNo >= writer->prepareSeqNo)
-				&& (!SxactIsReadOnly(t0)
-			  || t0->SeqNo.lastCommitBeforeSnapshot >= writer->prepareSeqNo))
+			hash_seq_init(&seqstat, reader->inConflictsTab);
+			while(conflict = (RWConflict)hash_seq_search(&seqstat))
 			{
-				failure = true;
-				break;
+				SERIALIZABLEXACT *t0 = conflict->sxactOut;
+
+				if (!SxactIsDoomed(t0)
+					&& (!SxactIsCommitted(t0)
+						|| t0->commitSeqNo >= writer->prepareSeqNo)
+					&& (!SxactIsReadOnly(t0)
+				  || t0->SeqNo.lastCommitBeforeSnapshot >= writer->prepareSeqNo))
+				{
+					failure = true;
+					break;
+				}
 			}
-			conflict = (RWConflict)
-				SHMQueueNext(&reader->inConflicts,
-							 &conflict->inLink,
-							 offsetof(RWConflictData, inLink));
 		}
 	}
 
@@ -4693,6 +4724,7 @@ void
 PreCommit_CheckForSerializationFailure(void)
 {
 	RWConflict	nearConflict;
+	HASH_SEQ_STATUS nearseqstat;
 
 	if (MySerializableXact == InvalidSerializableXact)
 		return;
@@ -4712,22 +4744,18 @@ PreCommit_CheckForSerializationFailure(void)
 				 errhint("The transaction might succeed if retried.")));
 	}
 
-	nearConflict = (RWConflict)
-		SHMQueueNext(&MySerializableXact->inConflicts,
-					 &MySerializableXact->inConflicts,
-					 offsetof(RWConflictData, inLink));
-	while (nearConflict)
+	hash_seq_init(&nearseqstat, MySerializableXact->inConflictsTab);
+	while(nearConflict = hash_seq_search(&nearseqstat))
 	{
 		if (!SxactIsCommitted(nearConflict->sxactOut)
 			&& !SxactIsDoomed(nearConflict->sxactOut))
 		{
-			RWConflict	farConflict;
+			RWConflict farConflict;
+			HASH_SEQ_STATUS farseqstat;
+			
+			hash_seq_init(&farseqstat, nearConflict->sxactOut->inConflictsTab);
 
-			farConflict = (RWConflict)
-				SHMQueueNext(&nearConflict->sxactOut->inConflicts,
-							 &nearConflict->sxactOut->inConflicts,
-							 offsetof(RWConflictData, inLink));
-			while (farConflict)
+			while(farConflict = hash_seq_search(&farseqstat))
 			{
 				if (farConflict->sxactOut == MySerializableXact
 					|| (!SxactIsCommitted(farConflict->sxactOut)
@@ -4752,17 +4780,8 @@ PreCommit_CheckForSerializationFailure(void)
 					nearConflict->sxactOut->flags |= SXACT_FLAG_DOOMED;
 					break;
 				}
-				farConflict = (RWConflict)
-					SHMQueueNext(&nearConflict->sxactOut->inConflicts,
-								 &farConflict->inLink,
-								 offsetof(RWConflictData, inLink));
 			}
 		}
-
-		nearConflict = (RWConflict)
-			SHMQueueNext(&MySerializableXact->inConflicts,
-						 &nearConflict->inLink,
-						 offsetof(RWConflictData, inLink));
 	}
 
 	MySerializableXact->prepareSeqNo = ++(PredXact->LastSxactCommitSeqNo);
@@ -4969,8 +4988,11 @@ predicatelock_twophase_recover(TransactionId xid, uint16 info,
 		 * we'll conservatively assume that it had both a conflict in and a
 		 * conflict out, and represent that with the summary conflict flags.
 		 */
-		SHMQueueInit(&(sxact->outConflicts));
-		SHMQueueInit(&(sxact->inConflicts));
+		/*
+		 * NOTE: initialization for conflict hash table is done in CreatePredXact
+		 */
+		//SHMQueueInit(&(sxact->outConflicts));
+		//SHMQueueInit(&(sxact->inConflicts));
 		sxact->flags |= SXACT_FLAG_SUMMARY_CONFLICT_IN;
 		sxact->flags |= SXACT_FLAG_SUMMARY_CONFLICT_OUT;
 
