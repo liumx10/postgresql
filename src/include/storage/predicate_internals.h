@@ -83,8 +83,10 @@ typedef struct SERIALIZABLEXACT
 		SerCommitSeqNo lastCommitBeforeSnapshot;		/* when not committed or
 														 * no conflict out */
 	}			SeqNo;
-	SHM_QUEUE	outConflicts;	/* list of write transactions whose data we
+	SHM_QUEUE   outConflictsSkip; 
+    SHM_QUEUE	outConflicts;	/* list of write transactions whose data we
 								 * couldn't read. */
+    SHM_QUEUE   inConflictsSkip;
 	SHM_QUEUE	inConflicts;	/* list of read transactions which couldn't
 								 * see our write. */
 	SHM_QUEUE	predicateLocks; /* list of associated PREDICATELOCK objects */
@@ -194,7 +196,9 @@ typedef struct PredXactListData *PredXactList;
  */
 typedef struct RWConflictData
 {
+    SHM_QUEUE   outLinkSkip;
 	SHM_QUEUE	outLink;		/* link for list of conflicts out from a sxact */
+    SHM_QUEUE   inLinkSkip;
 	SHM_QUEUE	inLink;			/* link for list of conflicts in to a sxact */
 	SERIALIZABLEXACT *sxactOut;
 	SERIALIZABLEXACT *sxactIn;

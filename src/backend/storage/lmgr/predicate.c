@@ -627,6 +627,170 @@ NextPredXact(SERIALIZABLEXACT *sxact)
 	return &ptle->sxact;
 }
 
+
+static void InsertConflictSkipList(SHM_QUEUE* highqueue, SHM_QUEUE* lowqueue, bool isReader, 
+                                    unsigned long item, RWConflict conflict)
+{
+        Size offset;
+        RWConflict lowLevelPredConflict, lowLevelNextConflict,
+                        highLevelPredConflict, highLevelNextConflict;
+        unsigned long   currentItem;
+        int randomNum; 
+
+        if (isReader)
+            offset = offsetof(RWConflictData, outLinkSkip);
+        else
+            offset = offsetof(RWConflictData, inLinkSkip);
+
+        highLevelPredConflict = NULL;
+        highLevelNextConflict = (RWConflict) SHMQueueNext(highqueue, highqueue, offset);
+        while (highLevelNextConflict) 
+    {
+                if (isReader)
+                    currentItem = (unsigned long)highLevelNextConflict->sxactIn;
+                else
+                    currentItem = (unsigned long)highLevelNextConflict->sxactOut;
+
+                if (currentItem > item)
+                    break;
+                highLevelPredConflict = highLevelNextConflict;
+                if (isReader)
+                    highLevelNextConflict = (RWConflict) SHMQueueNext(highqueue,
+                                                                                                                                  &highLevelNextConflict->outLinkSkip,
+                                                                                                                                  offset);
+                else
+                    highLevelNextConflict = (RWConflict) SHMQueueNext(highqueue,
+                                                                                                                                  &highLevelNextConflict->inLinkSkip,
+                                                                                                                                  offset);
+            
+    }
+
+        if (isReader)
+            offset = offsetof(RWConflictData, outLink);
+        else
+            offset = offsetof(RWConflictData, inLink);
+
+        if (highLevelPredConflict)
+    {
+                lowLevelPredConflict = highLevelPredConflict;
+                if (isReader)
+                    lowLevelNextConflict = (RWConflict) SHMQueueNext(lowqueue,
+                                                                                                                                 &lowLevelPredConflict->outLink,
+                                                                                                                                 offset);
+                else 
+                    lowLevelNextConflict = (RWConflict) SHMQueueNext(lowqueue,
+                                                                                                                                 &lowLevelPredConflict->inLink,
+                                                                                                                                 offset);
+            
+    }
+    else
+    {
+                lowLevelPredConflict = NULL;
+                if (isReader)
+                    lowLevelNextConflict = (RWConflict) SHMQueueNext(lowqueue, lowqueue, offset);
+                else
+                    lowLevelNextConflict = (RWConflict) SHMQueueNext(lowqueue, lowqueue, offset);
+            
+    }
+
+        /* 
+        *    * We set the skip length as 10 temporarily.
+        *        */
+
+                randomNum = rand()%10;
+
+                    while(lowLevelNextConflict)
+                    {
+                        
+                                if (isReader)
+                                    currentItem = (unsigned long)highLevelNextConflict->sxactIn;
+                                else
+                                    currentItem = (unsigned long)highLevelNextConflict->sxactOut;
+
+                                if (currentItem > item)
+                        {
+                                        if (isReader)
+                            {
+                                                SHMQueueInsertBefore(&lowLevelNextConflict->outLink,
+                                                                                                         &conflict->outLink);
+                                                if (randomNum == 0)
+                                {
+                                                        if (highLevelPredConflict)
+                                                            SHMQueueInsertAfter(&highLevelPredConflict->outLinkSkip,
+                                                                                                                        &conflict->outLinkSkip);
+                                                        else
+                                                            SHMQueueInsertAfter(highqueue, &conflict->outLinkSkip);
+                                                    
+                                }
+                                            
+                            }
+                                        else
+                            {
+                                                SHMQueueInsertBefore(&lowLevelNextConflict->inLink,
+                                                                                                         &conflict->inLink);
+                                                if (randomNum == 0)
+                                {
+                                                        if (highLevelPredConflict)
+                                                            SHMQueueInsertAfter(&highLevelPredConflict->inLinkSkip,
+                                                                                                                        &conflict->inLinkSkip);
+                                                        else
+                                                            SHMQueueInsertAfter(highqueue, &conflict->inLinkSkip);
+                                                    
+                                }
+                                            
+                            }
+                                        break;
+                                    
+                        }
+                                lowLevelPredConflict = lowLevelNextConflict;
+                                        if (isReader)
+                                    lowLevelNextConflict = (RWConflict) SHMQueueNext(lowqueue,
+                                                                                                                                                 &lowLevelNextConflict->outLink, 
+                                                                                                                                                 offset);
+                                else
+                                    lowLevelNextConflict = (RWConflict) SHMQueueNext(lowqueue,
+                                                                                                                                                 &lowLevelNextConflict->inLink, 
+                                                                                                                                                 offset);
+                        
+                    }
+                        if (isReader)
+                        {
+                                    if (lowLevelPredConflict)
+                                        SHMQueueInsertAfter(&lowLevelPredConflict->outLink, &conflict->outLink);
+                                    else
+                                        SHMQueueInsertAfter(lowqueue, &conflict->outLink);
+
+                                    if (randomNum == 0)
+                            {
+                                            if (highLevelPredConflict)
+                                                SHMQueueInsertAfter(&highLevelPredConflict->outLinkSkip,
+                                                                                                    &conflict->outLinkSkip);
+                                            else
+                                                SHMQueueInsertAfter(highqueue, &conflict->outLinkSkip);
+                                        
+                            }
+                                
+                        }
+                            else
+                            {
+                                        if (lowLevelPredConflict)
+                                            SHMQueueInsertAfter(&lowLevelPredConflict->inLink, &conflict->inLink);
+                                        else
+                                            SHMQueueInsertAfter(lowqueue, &conflict->inLink);
+
+                                        if (randomNum == 0)
+                                {
+                                                if (highLevelPredConflict)
+                                                    SHMQueueInsertAfter(&highLevelPredConflict->inLinkSkip,
+                                                                                                        &conflict->inLinkSkip);
+                                                else
+                                                    SHMQueueInsertAfter(highqueue, &conflict->inLinkSkip);
+                                            
+                                }
+                                    
+                            }
+
+}
 /*------------------------------------------------------------------------*/
 
 /*
@@ -636,6 +800,7 @@ static bool
 RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 {
 	RWConflict	conflict;
+    RWConflict  nextConflict;
 
 	Assert(reader != writer);
 
@@ -647,7 +812,7 @@ RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 		return false;
 
 	/* A conflict is possible; walk the list to find out. */
-	conflict = (RWConflict)
+	/* conflict = (RWConflict)
 		SHMQueueNext(&reader->outConflicts,
 					 &reader->outConflicts,
 					 offsetof(RWConflictData, outLink));
@@ -660,6 +825,48 @@ RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 						 &conflict->outLink,
 						 offsetof(RWConflictData, outLink));
 	}
+    */
+
+    unsigned long writerAddr = (unsigned long)writer;
+    unsigned long conflictAddr;
+
+    conflict = NULL;
+    nextConflict = (RWConflict)
+        SHMQueueNext(&reader->outConflictsSkip,
+                     &reader->outConflictsSkip,
+                     offsetof(RWConflictData, outLinkSkip));
+    while(nextConflict){
+        if (nextConflict->sxactIn == writer)
+            return true;
+        conflictAddr = (unsigned long)nextConflict->sxactIn;
+        if (conflictAddr > writerAddr)
+            break;
+
+        conflict = nextConflict;
+        nextConflict = (RWConflict)
+            SHMQueueNext(&reader->outConflictsSkip,
+                        &conflict->outLinkSkip,
+                        offsetof(RWConflictData, outLinkSkip));
+    }
+
+    if (conflict = NULL)
+        conflict = (RWConflict)
+            SHMQueueNext(&reader->outConflicts,
+                         &reader->outConflicts,
+                         offsetof(RWConflictData, outLink));
+    while (conflict)
+    {
+        if (conflict->sxactIn == writer)
+            return true;
+        conflictAddr = (unsigned long)conflict->sxactIn;
+        if (conflictAddr > writerAddr)
+            break;
+
+        conflict = (RWConflict)
+            SHMQueueNext(&reader->outConflicts,
+                         &conflict->outLink,
+                         offsetof(RWConflictData, outLink));
+    }
 
 	/* No conflict found. */
 	return false;
@@ -687,8 +894,11 @@ SetRWConflict(SERIALIZABLEXACT *reader, SERIALIZABLEXACT *writer)
 
 	conflict->sxactOut = reader;
 	conflict->sxactIn = writer;
-	SHMQueueInsertBefore(&reader->outConflicts, &conflict->outLink);
-	SHMQueueInsertBefore(&writer->inConflicts, &conflict->inLink);
+//	SHMQueueInsertBefore(&reader->outConflicts, &conflict->outLink);
+//	SHMQueueInsertBefore(&writer->inConflicts, &conflict->inLink);
+    
+    InsertConflictSkipList(&reader->outConflictsSkip, &reader->outConflicts, true, (unsigned long)writer, conflict);
+    InsertConflictSkipList(&reader->inConflictsSkip, &reader->inConflicts, false, (unsigned long)writer, conflict); 
 }
 
 static void
@@ -726,6 +936,10 @@ ReleaseRWConflict(RWConflict conflict)
 {
 	SHMQueueDelete(&conflict->inLink);
 	SHMQueueDelete(&conflict->outLink);
+    if (ShmemAddrIsValid(conflict->outLinkSkip.next))
+    	SHMQueueDelete(&conflict->outLinkSkip);
+    if (ShmemAddrIsValid(conflict->inLinkSkip.next))
+    	SHMQueueDelete(&conflict->inLinkSkip);
 	SHMQueueInsertBefore(&RWConflictPool->availableList, &conflict->outLink);
 }
 
