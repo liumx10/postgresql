@@ -645,7 +645,7 @@ SkipListElemInit(SHM_SKIPLIST* skiplist)
 	SHMQueueInit(&skiplist->belowLink);
 }
 
-static bool
+static inline bool
 SkipListFindElem(SHM_SKIPLIST* skiplist, Size valueOffset, unsigned long value,
 	SHM_SKIPLIST** topLinkPreElem, SHM_SKIPLIST** belowLinkPreElem)
 {
@@ -655,8 +655,8 @@ SkipListFindElem(SHM_SKIPLIST* skiplist, Size valueOffset, unsigned long value,
 
 	curElem = skiplist;
 	result = false;
-	nextElem = (SHM_SKIPLIST*) SHMQueueNext(&skiplist->topLink, 
-										&curElem->topLink, 
+	nextElem = (SHM_SKIPLIST*) SHMQueueNext(&(skiplist->topLink), 
+										&(curElem->topLink), 
 										offsetof(SHM_SKIPLIST, topLink));
 	while (nextElem)
 	{
@@ -679,8 +679,8 @@ SkipListFindElem(SHM_SKIPLIST* skiplist, Size valueOffset, unsigned long value,
 	if (topLinkPreElem)
 		*topLinkPreElem = curElem;
 
-	nextElem = (SHM_SKIPLIST*)SHMQueueNext(&skiplist->belowLink,
-										&curElem->belowLink,
+	nextElem = (SHM_SKIPLIST*)SHMQueueNext(&(skiplist->belowLink),
+										&(curElem->belowLink),
 										offsetof(SHM_SKIPLIST, belowLink));
 	while (nextElem)
 	{
@@ -703,7 +703,7 @@ SkipListFindElem(SHM_SKIPLIST* skiplist, Size valueOffset, unsigned long value,
 	return result;
 }
 
-static void 
+static inline void 
 SkipListInsert(SHM_SKIPLIST* skiplist, Size valueOffset, SHM_SKIPLIST* elem)
 {
 	unsigned long elemValue;
@@ -718,12 +718,12 @@ SkipListInsert(SHM_SKIPLIST* skiplist, Size valueOffset, SHM_SKIPLIST* elem)
 	Assert(topLinkPreElem);
 	Assert(belowLinkPreElem);
 
-	if (rand()%5 == 0)
+	if (rand()%6 == 0)
 		SHMQueueInsertAfter(&topLinkPreElem->topLink, &elem->topLink);
 	SHMQueueInsertAfter(&belowLinkPreElem->belowLink, &elem->belowLink);
 }
 
-static bool
+static inline bool
 SkipListExist(SHM_SKIPLIST* skiplist, Size valueOffset, unsigned long value)
 {
 	return SkipListFindElem(skiplist, valueOffset, value, NULL, NULL);
@@ -1226,6 +1226,88 @@ CheckPointPredicate(void)
 void
 InitPredicateLocks(void)
 {
+	RWConflict conflicts = (RWConflict)malloc(1000*sizeof(RWConflictData));
+	RWConflictData listhead;
+	RWConflict curElem;
+	clock_t start, finish; 
+
+	srand(time(NULL));
+
+	SHMQueueInit(&listhead.outLink);
+	SHMQueueInit(&listhead.outTopLink);
+	SHMQueueInit(&listhead.inLink);
+	SHMQueueInit(&listhead.inTopLink);
+
+	int i, j, k, s;
+	for (i=0; i<1000; i++){
+		SHMQueueInit(&conflicts[i].outTopLink);
+		SHMQueueInit(&conflicts[i].outLink);
+		SHMQueueInit(&conflicts[i].inTopLink);
+		SHMQueueInit(&conflicts[i].inLink);
+	}
+
+	for (i=2; i<30; i+=2){
+		printf("queue length: %d\n", i);
+
+		for (j=0; j<i; j++){
+			SHMQueueInsertBefore(&listhead.outLink, &conflicts[j].outLink);
+			conflicts[j].sxactIn = (SERIALIZABLEXACT*)(4*j);
+		}
+		start = clock();
+		for (k=0; k<100000; k++){
+			for (j=1; j<i; j++){
+				curElem = (RWConflict) SHMQueueNext(&listhead.outLink, 
+													&listhead.outLink, 
+													offsetof(RWConflictData, outLink));
+				while(curElem){
+					if (curElem->sxactIn == (SERIALIZABLEXACT*)(4*j)){
+						break;
+					}
+					curElem = (RWConflict) SHMQueueNext(&listhead.outLink, 
+														&curElem->outLink, 
+														offsetof(RWConflictData, outLink));
+					Assert(curElem);
+				}
+			}
+		}
+		finish = clock();
+
+		for (j=0; j<i; j++){
+			SHMQueueDelete(&conflicts[j].outLink);
+			if (conflicts[j].outTopLink.prev)
+				SHMQueueDelete(&conflicts[j].outTopLink);
+		}
+		
+
+		printf("\tLinked list take %.3lf ms\n", 1000*(double)(finish-start)/CLOCKS_PER_SEC);
+		
+
+		Size offset; 
+		offset = SKIPLIST_VALUE_OFFSET(RWConflictData, outTopLink, sxactIn);
+		bool find;
+
+		for (j=0; j<i; j++){
+			SkipListInsert(&listhead.outTopLink, offset, &conflicts[j]);
+		}
+
+		start = clock();
+		for (k=0; k<100000; k++){
+			for (j=1; j<i; j++){
+				find = SkipListExist(&listhead.outTopLink, offset, 4*j);
+				Assert(find);
+			}
+		}
+		finish = clock();
+
+		for (j=0; j<i; j++){
+				SHMQueueDelete(&conflicts[j].outLink);
+				if (conflicts[j].outTopLink.prev)
+					SHMQueueDelete(&conflicts[j].outTopLink);
+			}
+		printf("\tSkip list take %.3lf ms\n", 1000*(double)(finish-start)/CLOCKS_PER_SEC);
+	}
+
+	exit(0);
 	HASHCTL		info;
 	long		max_table_size;
 	Size		requestSize;
