@@ -83,9 +83,12 @@ typedef struct SERIALIZABLEXACT
 		SerCommitSeqNo lastCommitBeforeSnapshot;		/* when not committed or
 														 * no conflict out */
 	}			SeqNo;
+	int 		outConflictsNum;
 	SHM_QUEUE	outConflictsTopLink;
 	SHM_QUEUE	outConflicts;	/* list of write transactions whose data we
 								 * couldn't read. */
+
+	int 		inConflictsNum;
 	SHM_QUEUE	inConflictsTopLink;
 	SHM_QUEUE	inConflicts;	/* list of read transactions which couldn't
 								 * see our write. */
