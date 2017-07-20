@@ -638,13 +638,6 @@ NextPredXact(SERIALIZABLEXACT *sxact)
 			(offsetof(type, value_field) - offsetof(type, skiplist_field))
 
 
-static void
-SkipListElemInit(SHM_SKIPLIST* skiplist)
-{
-	SHMQueueInit(&skiplist->topLink);
-	SHMQueueInit(&skiplist->belowLink);
-}
-
 static inline bool
 SkipListFindElem(SHM_SKIPLIST* skiplist, Size valueOffset, unsigned long value,
 	SHM_SKIPLIST** topLinkPreElem, SHM_SKIPLIST** belowLinkPreElem)
@@ -708,13 +701,13 @@ SkipListInsert(SHM_SKIPLIST* skiplist, Size valueOffset, SHM_SKIPLIST* elem)
 {
 	unsigned long elemValue;
 	SHM_SKIPLIST* topLinkPreElem, *belowLinkPreElem;
+	bool find;
 	topLinkPreElem = NULL;
 	belowLinkPreElem = NULL;
-	bool find;
 
 	elemValue = GET_SKIPLIST_VALUE(elem, valueOffset);
 	find = SkipListFindElem(skiplist, valueOffset, elemValue, &topLinkPreElem, &belowLinkPreElem);
-	Assert(!find);
+	Assert(find == false);
 	Assert(topLinkPreElem);
 	Assert(belowLinkPreElem);
 
@@ -752,15 +745,15 @@ RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 		return false;
 
 	/* A conflict is possible; walk the list to find out. */
-	
-	if (reader->outConflictsNum > 5)
-	{
+    if (reader->outConflictsNum > 150 )
+    {
 		valueOffset = SKIPLIST_VALUE_OFFSET(RWConflictData, outTopLink, sxactIn);
 		return SkipListExist((SHM_SKIPLIST*)&reader->outConflictsTopLink, 
 					  valueOffset,
 					  GET_SKIPLIST_VALUE(reader, valueOffset));
 	}
-	conflict = (RWConflict)
+
+    conflict = (RWConflict)
 		SHMQueueNext(&reader->outConflicts,
 					 &reader->outConflicts,
 					 offsetof(RWConflictData, outLink));
@@ -803,6 +796,7 @@ SetRWConflict(SERIALIZABLEXACT *reader, SERIALIZABLEXACT *writer)
 
 	conflict->sxactOut = reader;
 	conflict->sxactIn = writer;
+
 //	SHMQueueInsertBefore(&reader->outConflicts, &conflict->outLink);
 //	SHMQueueInsertBefore(&writer->inConflicts, &conflict->inLink);
 	SkipListInsert((SHM_SKIPLIST*)&reader->outConflictsTopLink, 
@@ -3567,6 +3561,7 @@ ReleasePredicateLocks(bool isCommit)
 			|| SxactIsCommitted(conflict->sxactIn)
 			|| (conflict->sxactIn->SeqNo.lastCommitBeforeSnapshot >= PredXact->LastSxactCommitSeqNo)){
 			MySerializableXact->outConflictsNum--;
+            conflict->sxactIn->inConflictsNum--;
 			ReleaseRWConflict(conflict);
 		}
 
@@ -3592,6 +3587,7 @@ ReleasePredicateLocks(bool isCommit)
 			|| SxactIsCommitted(conflict->sxactOut)
 			|| SxactIsReadOnly(conflict->sxactOut)){
 			MySerializableXact->inConflictsNum--;
+            conflict->sxactOut->outConflictsNum--;
 			ReleaseRWConflict(conflict);
 		}
 
@@ -3986,6 +3982,7 @@ ReleaseOneSerializableXact(SERIALIZABLEXACT *sxact, bool partial,
 				conflict->sxactIn->flags |= SXACT_FLAG_SUMMARY_CONFLICT_IN;
 			ReleaseRWConflict(conflict);
 			sxact->outConflictsNum--;
+            conflict->sxactIn->inConflictsNum--;
 			conflict = nextConflict;
 		}
 	}
@@ -4005,6 +4002,7 @@ ReleaseOneSerializableXact(SERIALIZABLEXACT *sxact, bool partial,
 			conflict->sxactOut->flags |= SXACT_FLAG_SUMMARY_CONFLICT_OUT;
 		ReleaseRWConflict(conflict);
 		sxact->inConflictsNum--;
+        conflict->sxactOut->outConflictsNum--;
 		conflict = nextConflict;
 	}
 
