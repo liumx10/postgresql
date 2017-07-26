@@ -711,7 +711,7 @@ SkipListInsert(SHM_SKIPLIST* skiplist, Size valueOffset, SHM_SKIPLIST* elem)
 	Assert(topLinkPreElem);
 	Assert(belowLinkPreElem);
 
-	if (rand()%6 == 0)
+	if (rand()%3 == 0)
 		SHMQueueInsertAfter(&topLinkPreElem->topLink, &elem->topLink);
 	SHMQueueInsertAfter(&belowLinkPreElem->belowLink, &elem->belowLink);
 }
@@ -725,6 +725,11 @@ SkipListExist(SHM_SKIPLIST* skiplist, Size valueOffset, unsigned long value)
 
 
 /*------------------------------------------------------------------------*/
+inline unsigned long long currentcycles() {
+            unsigned long long result;
+                    __asm__ __volatile__ ("rdtsc" : "=A" (result));
+            return result;
+}
 
 /*
  * These functions manage primitive access to the RWConflict pool and lists.
@@ -734,7 +739,10 @@ RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 {
 	RWConflict	conflict;
 	Size 		valueOffset;
-
+    unsigned long long _begin, _end;
+    bool result;
+    
+    result=  false;
 	Assert(reader != writer);
 
 	/* Check the ends of the purported conflict first. */
@@ -743,15 +751,16 @@ RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 		|| SHMQueueEmpty(&reader->outConflicts)
 		|| SHMQueueEmpty(&writer->inConflicts))
 		return false;
-
+    
+    _begin = currentcycles();
 	/* A conflict is possible; walk the list to find out. */
-    if (reader->outConflictsNum > 150 )
+    if (reader->outConflictsNum > 10 )
     {
 		valueOffset = SKIPLIST_VALUE_OFFSET(RWConflictData, outTopLink, sxactIn);
-		return SkipListExist((SHM_SKIPLIST*)&reader->outConflictsTopLink, 
+		result =  SkipListExist((SHM_SKIPLIST*)&reader->outConflictsTopLink, 
 					  valueOffset,
 					  GET_SKIPLIST_VALUE(reader, valueOffset));
-	}
+	}else{
 
     conflict = (RWConflict)
 		SHMQueueNext(&reader->outConflicts,
@@ -760,7 +769,9 @@ RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 	while (conflict)
 	{
 		if (conflict->sxactIn == writer){
-			return true;
+		//	return true;
+            result = true;
+            break;
 		}
 		conflict = (RWConflict)
 			SHMQueueNext(&reader->outConflicts,
@@ -768,6 +779,10 @@ RWConflictExists(const SERIALIZABLEXACT *reader, const SERIALIZABLEXACT *writer)
 						 offsetof(RWConflictData, outLink));
 	}
 
+    }
+    _end = currentcycles();
+//    printf("%llu\n", _end - _begin);
+    return result;
 	/* No conflict found. */
 	return false;
 }
